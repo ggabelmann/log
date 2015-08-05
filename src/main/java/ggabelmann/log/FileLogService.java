@@ -34,11 +34,11 @@ import java.util.stream.Stream;
  */
 public class FileLogService extends AbstractIdleService implements Log {
 	
-	private final List<LogEntryMetadata> metadata;
+	private final List<LogItemMetadata> metadata;
 	private int nextId;
 	private final Path path;
 	private final ReadWriteLock rwl;
-	final static int logEntryHeaderLength = 1 + 4 + 32 + 4;
+	final static int logItemHeaderLength = 1 + 4 + 32 + 4;
 	final static int copyToWindow = 64 * 1024;
 	
 	/**
@@ -67,7 +67,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 	public LogItem getLogItem(final int id) {
 		ensureIsRunning();
 		if (id >= 0 && id < metadata.size()) {
-			final LogEntryMetadata entry = metadata.get(id);
+			final LogItemMetadata entry = metadata.get(id);
 			return new FileLogItem(entry);
 		}
 		else {
@@ -76,7 +76,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 	}
 	
 	/**
-	 * @throws UnsupportedOperationException Always.
+	 * @throws UnsupportedOperationException Always thrown.
 	 */
 	public Stream<LogItem> getLogItems(final int startId, final int count) {
 		throw new UnsupportedOperationException("Not supported yet.");
@@ -128,9 +128,28 @@ public class FileLogService extends AbstractIdleService implements Log {
 		}
 	}
 	
+	/**
+	 * The format of a LogItem on disk is:
+	 * <ol>
+	 * <li>byte: type</li>
+	 * <li>int: id</li>
+	 * <li>byte[32]: sha256 of data</li>
+	 * <li>int: length of data</li>
+	 * </ol>
+	 * I think this is a good format because the sha256 protects the data and the length comes after because it's stored inline.
+	 * If the data was stored in a BlobStore (which would allow deduplication) then the length would be omitted.
+	 * The sha256 may also allow the sharing of hash-trees (which enable efficient sharing of data and detection of errors). TBD.
+	 * 
+	 * Note: the whole LogItem is not hashed (protected) in this format.
+	 * I think the filesystem should provide that protection. For example, ZFS with mirrors or raidz.
+	 * 
+	 * @param is
+	 * @return
+	 * @throws IOException 
+	 */
 	private int logHelper(final InputStream is) throws IOException {
 		final byte[] bytes = ByteStreams.toByteArray(is);
-		final ByteBuffer bb = ByteBuffer.allocate(logEntryHeaderLength);
+		final ByteBuffer bb = ByteBuffer.allocate(logItemHeaderLength);
 
 		bb.put((byte) 0);	// type
 		bb.putInt(getNextId());	// id
@@ -142,7 +161,8 @@ public class FileLogService extends AbstractIdleService implements Log {
 			ByteStreams.copy(new ByteArrayInputStream(bytes), os);
 		}
 		
-		metadata.add(new LogEntryMetadata(bytes.length, Files.size(path) - bytes.length, getNextId()));
+		// Update metadata so that the new LogItem can be read.
+		metadata.add(new LogItemMetadata(Files.size(path) - bytes.length, bytes.length, getNextId()));
 		return getThenIncrementNextId();
 	}
 	
@@ -193,9 +213,9 @@ public class FileLogService extends AbstractIdleService implements Log {
 			if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
 				try (final InputStream is = Files.newInputStream(path, StandardOpenOption.READ)) {
 					final FileLogIterator fli = new FileLogIterator(is);
-					fli.forEachRemaining((final LogEntryMetadata lemd) -> {
-						if (lemd.id == metadata.size()) {
-							metadata.add(lemd);
+					fli.forEachRemaining((final LogItemMetadata limd) -> {
+						if (limd.id == metadata.size()) {
+							metadata.add(limd);
 						}
 						else {
 							throw new IllegalStateException("id does not match position within list.");
@@ -223,15 +243,15 @@ public class FileLogService extends AbstractIdleService implements Log {
 	 * Records information about the locations of data within the log's file.
 	 * This helps with random reads.
 	 */
-	private static class LogEntryMetadata {
+	private static class LogItemMetadata {
 		
 		private final int dataLength;
 		private final long dataStart;
 		private final int id;
 		
-		private LogEntryMetadata(final int dataLength, final long dataStart, final int id) {
-			this.dataLength = dataLength;
+		private LogItemMetadata(final long dataStart, final int dataLength, final int id) {
 			this.dataStart = dataStart;
+			this.dataLength = dataLength;
 			this.id = id;
 		}
 	}
@@ -241,10 +261,10 @@ public class FileLogService extends AbstractIdleService implements Log {
 	 */
 	private class FileLogItem implements LogItem {
 		
-		private final LogEntryMetadata lemd;
+		private final LogItemMetadata limd;
 		
-		private FileLogItem(final LogEntryMetadata lemd) {
-			this.lemd = lemd;
+		private FileLogItem(final LogItemMetadata limd) {
+			this.limd = limd;
 		}
 		
 		/**
@@ -255,14 +275,15 @@ public class FileLogService extends AbstractIdleService implements Log {
 		@Override
 		public void copyTo(final OutputStream os) {
 			// Necessary to grab read lock before creating RandomAccessFile.
-			// Grabbing the lock outside of try/finally is fine.
+			// Grabbing the lock outside of try/finally is fine according to official Javadoc.
 			rwl.readLock().lock();
 			try (final RandomAccessFile raf = new RandomAccessFile(path.toFile(), "r")) {
-				int left = lemd.dataLength;
+				int left = limd.dataLength;
 				int read = 0;
 				byte[] buffer = new byte[copyToWindow];
-				raf.seek(lemd.dataStart);
+				raf.seek(limd.dataStart);
 				
+				// This is kind of ugly. Cleanup?
 				while ((left > 0) && ((read = raf.read(buffer, 0, Math.min(left, buffer.length))) >= 0)) {
 					os.write(buffer, 0, read);
 					left -= read;
@@ -278,7 +299,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 		
 		@Override
 		public int getId() {
-			return lemd.id;
+			return limd.id;
 		}
 	}
 	
@@ -288,7 +309,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 	 * It does not check that IDs increment properly.
 	 * Right now the caller has to do that (could change in the future).
 	 */
-	private class FileLogIterator extends AbstractIterator<LogEntryMetadata> {
+	private class FileLogIterator extends AbstractIterator<LogItemMetadata> {
 
 		private final InputStream is;
 		private int pos;
@@ -299,9 +320,9 @@ public class FileLogService extends AbstractIdleService implements Log {
 		}
 
 		@Override
-		protected LogEntryMetadata computeNext() {
+		protected LogItemMetadata computeNext() {
 			try {
-				byte[] buffer = new byte[logEntryHeaderLength];
+				byte[] buffer = new byte[logItemHeaderLength];
 				int read = 0;
 				do {
 					read = is.read(buffer);
@@ -312,10 +333,10 @@ public class FileLogService extends AbstractIdleService implements Log {
 				}
 				else {
 					// We've read at least one byte by this point.
-					// Check the type is correct, otherwise the header size will be wrong.
+					// Check the type is correct, otherwise the header size is wrong.
 					if (buffer[0] != (byte) 0) throw new IllegalStateException("type is not 0.");
 
-					// Read the whole header.
+					// Read remainder of header.
 					ByteStreams.readFully(is, buffer, read /* offset */, buffer.length - read);
 					pos += buffer.length;
 					return deserializeAndCheck(buffer);
@@ -326,7 +347,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 			}
 		}
 		
-		private LogEntryMetadata deserializeAndCheck(final byte[] buffer) {
+		private LogItemMetadata deserializeAndCheck(final byte[] buffer) {
 			final ByteBuffer bb = ByteBuffer.wrap(buffer);
 			
 			bb.get();	// Skip over the type because it was checked by the caller.
@@ -343,7 +364,7 @@ public class FileLogService extends AbstractIdleService implements Log {
 			pos += length;
 			if (Arrays.equals(sha256, actualSha256) == false) throw new IllegalStateException("sha256 does not match.");
 
-			return new LogEntryMetadata(length, pos - length, id);
+			return new LogItemMetadata(pos - length, length, id);
 		}
 	}
 	
